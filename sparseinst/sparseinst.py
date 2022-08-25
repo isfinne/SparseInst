@@ -4,14 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from detectron2.modeling import build_backbone
-from detectron2.structures import ImageList, Instances, BitMasks
+from detectron2.modeling import build_backbone, detector_postprocess
+from detectron2.structures import ImageList, Instances, BitMasks, Boxes
 from detectron2.modeling import META_ARCH_REGISTRY, build_backbone
 
 from .encoder import build_sparse_inst_encoder
 from .decoder import build_sparse_inst_decoder
 from .loss import build_sparse_inst_criterion
-from .utils import nested_tensor_from_tensor_list
+from .utils import nested_tensor_from_tensor_list, box_xyxy_to_cxcywh, box_cxcywh_to_xyxy
 
 __all__ = ["SparseInst"]
 
@@ -74,18 +74,22 @@ class SparseInst(nn.Module):
             gt_classes = targets_per_image.gt_classes
             target["labels"] = gt_classes.to(self.device)
             h, w = targets_per_image.image_size
-            if not targets_per_image.has('gt_masks'):
-                gt_masks = BitMasks(torch.empty(0, h, w))
-            else:
-                gt_masks = targets_per_image.gt_masks
-                if self.mask_format == "polygon":
-                    if len(gt_masks.polygons) == 0:
-                        gt_masks = BitMasks(torch.empty(0, h, w))
-                    else:
-                        gt_masks = BitMasks.from_polygon_masks(
-                            gt_masks.polygons, h, w)
+            image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
+            # if not targets_per_image.has('gt_masks'):
+            #     gt_masks = BitMasks(torch.empty(0, h, w))
+            # else:
+            #     gt_masks = targets_per_image.gt_masks
+            #     if self.mask_format == "polygon":
+            #         if len(gt_masks.polygons) == 0:
+            #             gt_masks = BitMasks(torch.empty(0, h, w))
+            #         else:
+            #             gt_masks = BitMasks.from_polygon_masks(
+            #                 gt_masks.polygons, h, w)
 
-            target["masks"] = gt_masks.to(self.device)
+            # target["masks"] = gt_masks.to(self.device)
+            gt_boxes = targets_per_image.gt_boxes.tensor / image_size_xyxy
+            gt_boxes = box_xyxy_to_cxcywh(gt_boxes)
+            target["boxes"] = gt_boxes.to(self.device)
             new_targets.append(target)
 
         return new_targets
@@ -107,9 +111,16 @@ class SparseInst(nn.Module):
             losses = self.criterion(output, targets, max_shape)
             return losses
         else:
-            results = self.inference(
-                output, batched_inputs, max_shape, images.image_sizes)
-            processed_results = [{"instances": r} for r in results]
+            box_cls = output["pred_logits"]
+            box_pred = output["pred_boxes"]
+            mask_pred = None
+            results = self.inference(box_cls, box_pred, mask_pred, images.image_sizes)
+            processed_results = []
+            for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
+                height = input_per_image.get("height", image_size[0])
+                width = input_per_image.get("width", image_size[1])
+                r = detector_postprocess(results_per_image, height, width)
+                processed_results.append({"instances": r})
             return processed_results
 
     def forward_test(self, images):
@@ -128,55 +139,54 @@ class SparseInst(nn.Module):
         pred_masks = F.interpolate(
             pred_masks, scale_factor=4.0, mode="bilinear", align_corners=False)
         return pred_scores, pred_masks
+    
 
-    def inference(self, output, batched_inputs, max_shape, image_sizes):
-        # max_detections = self.max_detections
+    def inference(self, box_cls, box_pred, mask_pred, image_sizes):
+        """
+        Arguments:
+            box_cls (Tensor): tensor of shape (batch_size, num_queries, K).
+                The tensor predicts the classification probability for each query.
+            box_pred (Tensor): tensors of shape (batch_size, num_queries, 4).
+                The tensor predicts 4-vector (x,y,w,h) box
+                regression values for every queryx
+            image_sizes (List[torch.Size]): the input image sizes
+
+        Returns:
+            results (List[Instances]): a list of #images elements.
+        """
+        assert len(box_cls) == len(image_sizes)
         results = []
-        pred_scores = output["pred_logits"].sigmoid()
-        pred_masks = output["pred_masks"].sigmoid()
-        pred_objectness = output["pred_scores"].sigmoid()
-        pred_scores = torch.sqrt(pred_scores * pred_objectness)
 
-        for _, (scores_per_image, mask_pred_per_image, batched_input, img_shape) in enumerate(zip(
-                pred_scores, pred_masks, batched_inputs, image_sizes)):
+        # For each box we assign the best class or the second best if the best on is `no_object`.
+        scores, labels = F.softmax(box_cls, dim=-1)[:, :, :-1].max(-1)
 
-            ori_shape = (batched_input["height"], batched_input["width"])
-            result = Instances(ori_shape)
-            # max/argmax
-            scores, labels = scores_per_image.max(dim=-1)
-            # cls threshold
-            keep = scores > self.cls_threshold
-            scores = scores[keep]
-            labels = labels[keep]
-            mask_pred_per_image = mask_pred_per_image[keep]
+        for i, (scores_per_image, labels_per_image, box_pred_per_image, image_size) in enumerate(zip(
+            scores, labels, box_pred, image_sizes
+        )):
+            keep = scores_per_image > 0.005
+            scores_per_image = scores_per_image[keep]
+            labels_per_image = labels_per_image[keep]
+            box_pred_per_image = box_pred_per_image[keep]
 
-            if scores.size(0) == 0:
-                result.scores = scores
-                result.pred_classes = labels
+            if scores_per_image.size(0) == 0:
+                result.scores = scores_per_image
+                result.pred_classes = labels_per_image
                 results.append(result)
                 continue
 
-            h, w = img_shape
-            # rescoring mask using maskness
-            scores = rescoring_mask(
-                scores, mask_pred_per_image > self.mask_threshold, mask_pred_per_image)
+            result = Instances(image_size)
+            result.pred_boxes = Boxes(box_cxcywh_to_xyxy(box_pred_per_image))
 
-            # upsample the masks to the original resolution:
-            # (1) upsampling the masks to the padded inputs, remove the padding area
-            # (2) upsampling/downsampling the masks to the original sizes
-            mask_pred_per_image = F.interpolate(
-                mask_pred_per_image.unsqueeze(1), size=max_shape, mode="bilinear", align_corners=False)[:, :, :h, :w]
-            mask_pred_per_image = F.interpolate(
-                mask_pred_per_image, size=ori_shape, mode='bilinear', align_corners=False).squeeze(1)
+            result.pred_boxes.scale(scale_x=image_size[1], scale_y=image_size[0])
+            # if self.mask_on:
+            #     mask = F.interpolate(mask_pred[i].unsqueeze(0), size=image_size, mode='bilinear', align_corners=False)
+            #     mask = mask[0].sigmoid() > 0.5
+            #     B, N, H, W = mask_pred.shape
+            #     mask = BitMasks(mask.cpu()).crop_and_resize(result.pred_boxes.tensor.cpu(), 32)
+            #     result.pred_masks = mask.unsqueeze(1).to(mask_pred[0].device)
 
-            mask_pred = mask_pred_per_image > self.mask_threshold
-            # fix the bug for visualization
-            # mask_pred = BitMasks(mask_pred)
-
-            # using Detectron2 Instances to store the final results
-            result.pred_masks = mask_pred
-            result.scores = scores
-            result.pred_classes = labels
+            result.scores = scores_per_image
+            result.pred_classes = labels_per_image
             results.append(result)
-
+            
         return results

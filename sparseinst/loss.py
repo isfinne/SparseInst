@@ -9,7 +9,7 @@ from fvcore.nn import sigmoid_focal_loss_jit
 
 from detectron2.utils.registry import Registry
 
-from .utils import nested_masks_from_list, is_dist_avail_and_initialized, get_world_size
+from .utils import nested_masks_from_list, is_dist_avail_and_initialized, get_world_size, box_cxcywh_to_xyxy, generalized_box_iou
 
 SPARSE_INST_MATCHER_REGISTRY = Registry("SPARSE_INST_MATCHER")
 SPARSE_INST_MATCHER_REGISTRY.__doc__ = "Matcher for SparseInst"
@@ -58,17 +58,20 @@ class SparseInstCriterion(nn.Module):
         self.losses = cfg.MODEL.SPARSE_INST.LOSS.ITEMS
         self.weight_dict = self.get_weight_dict(cfg)
         self.num_classes = cfg.MODEL.SPARSE_INST.DECODER.NUM_CLASSES
+        empty_weight = torch.ones(self.num_classes + 1)
+        empty_weight[-1] = 0.1
+        self.register_buffer('empty_weight', empty_weight)
 
     def get_weight_dict(self, cfg):
-        losses = ("loss_ce", "loss_mask", "loss_dice", "loss_objectness")
+        losses = ("loss_ce", "loss_bbox", "loss_giou")
         weight_dict = {}
         ce_weight = cfg.MODEL.SPARSE_INST.LOSS.CLASS_WEIGHT
-        mask_weight = cfg.MODEL.SPARSE_INST.LOSS.MASK_PIXEL_WEIGHT
-        dice_weight = cfg.MODEL.SPARSE_INST.LOSS.MASK_DICE_WEIGHT
-        objectness_weight = cfg.MODEL.SPARSE_INST.LOSS.OBJECTNESS_WEIGHT
+        bbox_weight = cfg.MODEL.SPARSE_INST.LOSS.MASK_BBOX_WEIGHT
+        giou_weight = cfg.MODEL.SPARSE_INST.LOSS.MASK_GIOU_WEIGHT
+
 
         weight_dict = dict(
-            zip(losses, (ce_weight, mask_weight, dice_weight, objectness_weight)))
+            zip(losses, (ce_weight, bbox_weight, giou_weight)))
         return weight_dict
 
     def _get_src_permutation_idx(self, indices):
@@ -86,7 +89,10 @@ class SparseInstCriterion(nn.Module):
         return batch_idx, tgt_idx
 
     def loss_labels(self, outputs, targets, indices, num_instances, input_shape=None):
-        assert "pred_logits" in outputs
+        """Classification loss (NLL)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J]
@@ -95,79 +101,87 @@ class SparseInstCriterion(nn.Module):
                                     dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
 
-        src_logits = src_logits.flatten(0, 1)
-        # prepare one_hot target.
-        target_classes = target_classes.flatten(0, 1)
-        pos_inds = torch.nonzero(
-            target_classes != self.num_classes, as_tuple=True)[0]
-        labels = torch.zeros_like(src_logits)
-        labels[pos_inds, target_classes[pos_inds]] = 1
-        # comp focal loss.
-        class_loss = sigmoid_focal_loss_jit(
-            src_logits,
-            labels,
-            alpha=0.25,
-            gamma=2.0,
-            reduction="sum",
-        ) / num_instances
-        losses = {'loss_ce': class_loss}
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        losses = {'loss_ce': loss_ce}
+
         return losses
 
-    def loss_masks_with_iou_objectness(self, outputs, targets, indices, num_instances, input_shape):
-        src_idx = self._get_src_permutation_idx(indices)
-        tgt_idx = self._get_tgt_permutation_idx(indices)
-        # Bx100xHxW
-        assert "pred_masks" in outputs
-        assert "pred_scores" in outputs
-        src_iou_scores = outputs["pred_scores"]
-        src_masks = outputs["pred_masks"]
-        with torch.no_grad():
-            target_masks, _ = nested_masks_from_list(
-                [t["masks"].tensor for t in targets], input_shape).decompose()
-        num_masks = [len(t["masks"]) for t in targets]
-        target_masks = target_masks.to(src_masks)
-        if len(target_masks) == 0:
-            losses = {
-                "loss_dice": src_masks.sum() * 0.0,
-                "loss_mask": src_masks.sum() * 0.0,
-                "loss_objectness": src_iou_scores.sum() * 0.0
-            }
-            return losses
+    def loss_boxes(self, outputs, targets, indices, num_instances, input_shape=None):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
-        src_masks = src_masks[src_idx]
-        target_masks = F.interpolate(
-            target_masks[:, None], size=src_masks.shape[-2:], mode='bilinear', align_corners=False).squeeze(1)
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
 
-        src_masks = src_masks.flatten(1)
-        # FIXME: tgt_idx
-        mix_tgt_idx = torch.zeros_like(tgt_idx[1])
-        cum_sum = 0
-        for num_mask in num_masks:
-            mix_tgt_idx[cum_sum: cum_sum + num_mask] = cum_sum
-            cum_sum += num_mask
-        mix_tgt_idx += tgt_idx[1]
+        losses = {}
+        losses['loss_bbox'] = loss_bbox.sum() / num_instances
 
-        target_masks = target_masks[mix_tgt_idx].flatten(1)
-
-        with torch.no_grad():
-            ious = compute_mask_iou(src_masks, target_masks)
-
-        tgt_iou_scores = ious
-        src_iou_scores = src_iou_scores[src_idx]
-        tgt_iou_scores = tgt_iou_scores.flatten(0)
-        src_iou_scores = src_iou_scores.flatten(0)
-
-        losses = {
-            "loss_objectness": F.binary_cross_entropy_with_logits(src_iou_scores, tgt_iou_scores, reduction='mean'),
-            "loss_dice": dice_loss(src_masks, target_masks) / num_instances,
-            "loss_mask": F.binary_cross_entropy_with_logits(src_masks, target_masks, reduction='mean')
-        }
+        loss_giou = 1 - torch.diag(generalized_box_iou(
+            box_cxcywh_to_xyxy(src_boxes),
+            box_cxcywh_to_xyxy(target_boxes)))
+        losses['loss_giou'] = loss_giou.sum() / num_instances   
         return losses
+    
+    # def loss_masks_with_iou_objectness(self, outputs, targets, indices, num_instances, input_shape):
+    #     src_idx = self._get_src_permutation_idx(indices)
+    #     tgt_idx = self._get_tgt_permutation_idx(indices)
+    #     # Bx100xHxW
+    #     assert "pred_masks" in outputs
+    #     assert "pred_scores" in outputs
+    #     src_iou_scores = outputs["pred_scores"]
+    #     src_masks = outputs["pred_masks"]
+    #     with torch.no_grad():
+    #         target_masks, _ = nested_masks_from_list(
+    #             [t["masks"].tensor for t in targets], input_shape).decompose()
+    #     num_masks = [len(t["masks"]) for t in targets]
+    #     target_masks = target_masks.to(src_masks)
+    #     if len(target_masks) == 0:
+    #         losses = {
+    #             "loss_dice": src_masks.sum() * 0.0,
+    #             "loss_mask": src_masks.sum() * 0.0,
+    #             "loss_objectness": src_iou_scores.sum() * 0.0
+    #         }
+    #         return losses
+
+    #     src_masks = src_masks[src_idx]
+    #     target_masks = F.interpolate(
+    #         target_masks[:, None], size=src_masks.shape[-2:], mode='bilinear', align_corners=False).squeeze(1)
+
+    #     src_masks = src_masks.flatten(1)
+    #     # FIXME: tgt_idx
+    #     mix_tgt_idx = torch.zeros_like(tgt_idx[1])
+    #     cum_sum = 0
+    #     for num_mask in num_masks:
+    #         mix_tgt_idx[cum_sum: cum_sum + num_mask] = cum_sum
+    #         cum_sum += num_mask
+    #     mix_tgt_idx += tgt_idx[1]
+
+    #     target_masks = target_masks[mix_tgt_idx].flatten(1)
+
+    #     with torch.no_grad():
+    #         ious = compute_mask_iou(src_masks, target_masks)
+
+    #     tgt_iou_scores = ious
+    #     src_iou_scores = src_iou_scores[src_idx]
+    #     tgt_iou_scores = tgt_iou_scores.flatten(0)
+    #     src_iou_scores = src_iou_scores.flatten(0)
+
+    #     losses = {
+    #         "loss_objectness": F.binary_cross_entropy_with_logits(src_iou_scores, tgt_iou_scores, reduction='mean'),
+    #         "loss_dice": dice_loss(src_masks, target_masks) / num_instances,
+    #         "loss_mask": F.binary_cross_entropy_with_logits(src_masks, target_masks, reduction='mean')
+    #     }
+    #     return losses
 
     def get_loss(self, loss, outputs, targets, indices, num_instances, **kwargs):
         loss_map = {
             "labels": self.loss_labels,
-            "masks": self.loss_masks_with_iou_objectness,
+            "boxes": self.loss_boxes,
         }
         if loss == "loss_objectness":
             # NOTE: loss_objectness will be calculated in `loss_masks_with_iou_objectness`
@@ -262,47 +276,62 @@ class SparseInstMatcher(nn.Module):
 
     def __init__(self, cfg):
         super().__init__()
-        self.alpha = cfg.MODEL.SPARSE_INST.MATCHER.ALPHA
-        self.beta = cfg.MODEL.SPARSE_INST.MATCHER.BETA
-        self.mask_score = dice_score
+        self.cost_class =  cfg.MODEL.SPARSE_INST.MATCHER.COST_CLASS
+        self.cost_bbox = cfg.MODEL.SPARSE_INST.MATCHER.COST_BBOX
+        self.cost_giou = cfg.MODEL.SPARSE_INST.MATCHER.COST_GIOU
 
     def forward(self, outputs, targets, input_shape):
-        with torch.no_grad():
-            B, N, H, W = outputs["pred_masks"].shape
-            pred_masks = outputs['pred_masks']
-            pred_logits = outputs['pred_logits'].sigmoid()
+        """ Performs the matching
 
+        Params:
+            outputs: This is a dict that contains at least these entries:
+                 "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
+                 "pred_boxes": Tensor of dim [batch_size, num_queries, 4] with the predicted box coordinates
+
+            targets: This is a list of targets (len(targets) = batch_size), where each target is a dict containing:
+                 "labels": Tensor of dim [num_target_boxes] (where num_target_boxes is the number of ground-truth
+                           objects in the target) containing the class labels
+                 "boxes": Tensor of dim [num_target_boxes, 4] containing the target box coordinates
+
+        Returns:
+            A list of size batch_size, containing tuples of (index_i, index_j) where:
+                - index_i is the indices of the selected predictions (in order)
+                - index_j is the indices of the corresponding selected targets (in order)
+            For each batch element, it holds:
+                len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
+        """
+        with torch.no_grad():
+            bs, num_queries = outputs["pred_logits"].shape[:2]
+
+            # We flatten to compute the cost matrices in a batch
+            out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes]
+            out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4]
+
+            # Also concat the target labels and boxes
             tgt_ids = torch.cat([v["labels"] for v in targets])
+            tgt_bbox = torch.cat([v["boxes"] for v in targets])
 
             if tgt_ids.shape[0] == 0:
-                return [(torch.as_tensor([]).to(pred_logits), torch.as_tensor([]).to(pred_logits))] * B
-            tgt_masks, _ = nested_masks_from_list(
-                [t["masks"].tensor for t in targets], input_shape).decompose()
-            device = pred_masks.device
-            tgt_masks = tgt_masks.to(pred_masks)
+                return [(torch.as_tensor([]).to(out_prob), torch.as_tensor([]).to(out_prob))] * bs
 
-            tgt_masks = F.interpolate(
-                tgt_masks[:, None], size=pred_masks.shape[-2:], mode="bilinear", align_corners=False).squeeze(1)
+            # Compute the classification cost. Contrary to the loss, we don't use the NLL,
+            # but approximate it in 1 - proba[target class].
+            # The 1 is a constant that doesn't change the matching, it can be ommitted.
+            cost_class = -out_prob[:, tgt_ids]
 
-            pred_masks = pred_masks.view(B * N, -1)
-            tgt_masks = tgt_masks.flatten(1)
-            with autocast(enabled=False):
-                pred_masks = pred_masks.float()
-                tgt_masks = tgt_masks.float()
-                pred_logits = pred_logits.float()
-                mask_score = self.mask_score(pred_masks, tgt_masks)
-                # Nx(Number of gts)
-                matching_prob = pred_logits.view(B * N, -1)[:, tgt_ids]
-                C = (mask_score ** self.alpha) * (matching_prob ** self.beta)
+            # Compute the L1 cost between boxes
+            cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
-            C = C.view(B, N, -1).cpu()
-            # hungarian matching
-            sizes = [len(v["masks"]) for v in targets]
-            indices = [linear_sum_assignment(c[i], maximize=True)
-                       for i, c in enumerate(C.split(sizes, -1))]
-            indices = [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(
-                j, dtype=torch.int64)) for i, j in indices]
-            return indices
+            # Compute the giou cost betwen boxes
+            cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+
+            # Final cost matrix
+            C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+            C = C.view(bs, num_queries, -1).cpu()
+
+            sizes = [len(v["boxes"]) for v in targets]
+            indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
+            return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
 
 def build_sparse_inst_matcher(cfg):

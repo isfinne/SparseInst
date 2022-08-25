@@ -49,3 +49,9 @@ _darcs
 
 # mac file
 .DS_Store
+
+mini_train2017
+datasets
+pretrained_models
+minicoco
+coco-detection-visualization

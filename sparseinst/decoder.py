@@ -34,7 +34,7 @@ class InstanceBranch(nn.Module):
         dim = cfg.MODEL.SPARSE_INST.DECODER.INST.DIM
         num_convs = cfg.MODEL.SPARSE_INST.DECODER.INST.CONVS
         num_masks = cfg.MODEL.SPARSE_INST.DECODER.NUM_MASKS
-        kernel_dim = cfg.MODEL.SPARSE_INST.DECODER.KERNEL_DIM
+        # kernel_dim = cfg.MODEL.SPARSE_INST.DECODER.KERNEL_DIM
         self.num_classes = cfg.MODEL.SPARSE_INST.DECODER.NUM_CLASSES
 
         self.inst_convs = _make_stack_3x3_convs(num_convs, in_channels, dim)
@@ -42,9 +42,8 @@ class InstanceBranch(nn.Module):
         self.iam_conv = nn.Conv2d(dim, num_masks, 3, padding=1)
 
         # outputs
-        self.cls_score = nn.Linear(dim, self.num_classes)
-        self.mask_kernel = nn.Linear(dim, kernel_dim)
-        self.objectness = nn.Linear(dim, 1)
+        self.cls_score = nn.Linear(dim, self.num_classes + 1)
+        self.gen_bbox = MLP(dim, dim, 4, 3)
 
         self.prior_prob = 0.01
         self._init_weights()
@@ -59,8 +58,8 @@ class InstanceBranch(nn.Module):
         init.normal_(self.iam_conv.weight, std=0.01)
         init.normal_(self.cls_score.weight, std=0.01)
 
-        init.normal_(self.mask_kernel.weight, std=0.01)
-        init.constant_(self.mask_kernel.bias, 0.0)
+        # init.normal_(self.gen_bbox.weight, std=0.01)
+        # init.constant_(self.gen_bbox.bias, 0.0)
 
     def forward(self, features):
         # instance features (x4 convs)
@@ -80,32 +79,32 @@ class InstanceBranch(nn.Module):
         inst_features = inst_features / normalizer[:, :, None]
         # predict classification & segmentation kernel & objectness
         pred_logits = self.cls_score(inst_features)
-        pred_kernel = self.mask_kernel(inst_features)
-        pred_scores = self.objectness(inst_features)
-        return pred_logits, pred_kernel, pred_scores, iam
+        pred_boxes = self.gen_bbox(inst_features).sigmoid()
+        # pred_scores = self.objectness(inst_features)
+        return pred_logits, pred_boxes, iam
 
 
-class MaskBranch(nn.Module):
+# class MaskBranch(nn.Module):
 
-    def __init__(self, cfg, in_channels):
-        super().__init__()
-        dim = cfg.MODEL.SPARSE_INST.DECODER.MASK.DIM
-        num_convs = cfg.MODEL.SPARSE_INST.DECODER.MASK.CONVS
-        kernel_dim = cfg.MODEL.SPARSE_INST.DECODER.KERNEL_DIM
-        self.mask_convs = _make_stack_3x3_convs(num_convs, in_channels, dim)
-        self.projection = nn.Conv2d(dim, kernel_dim, kernel_size=1)
-        self._init_weights()
+#     def __init__(self, cfg, in_channels):
+#         super().__init__()
+#         dim = cfg.MODEL.SPARSE_INST.DECODER.MASK.DIM
+#         num_convs = cfg.MODEL.SPARSE_INST.DECODER.MASK.CONVS
+#         kernel_dim = cfg.MODEL.SPARSE_INST.DECODER.KERNEL_DIM
+#         self.mask_convs = _make_stack_3x3_convs(num_convs, in_channels, dim)
+#         self.projection = nn.Conv2d(dim, kernel_dim, kernel_size=1)
+#         self._init_weights()
 
-    def _init_weights(self):
-        for m in self.mask_convs.modules():
-            if isinstance(m, nn.Conv2d):
-                c2_msra_fill(m)
-        c2_msra_fill(self.projection)
+#     def _init_weights(self):
+#         for m in self.mask_convs.modules():
+#             if isinstance(m, nn.Conv2d):
+#                 c2_msra_fill(m)
+#         c2_msra_fill(self.projection)
 
-    def forward(self, features):
-        # mask features (x4 convs)
-        features = self.mask_convs(features)
-        return self.projection(features)
+#     def forward(self, features):
+#         # mask features (x4 convs)
+#         features = self.mask_convs(features)
+#         return self.projection(features)
 
 
 @SPARSE_INST_DECODER_REGISTRY.register()
@@ -120,7 +119,7 @@ class BaseIAMDecoder(nn.Module):
         self.output_iam = cfg.MODEL.SPARSE_INST.DECODER.OUTPUT_IAM
 
         self.inst_branch = InstanceBranch(cfg, in_channels)
-        self.mask_branch = MaskBranch(cfg, in_channels)
+        # self.mask_branch = MaskBranch(cfg, in_channels)
 
     @torch.no_grad()
     def compute_coordinates_linspace(self, x):
@@ -148,23 +147,22 @@ class BaseIAMDecoder(nn.Module):
     def forward(self, features):
         coord_features = self.compute_coordinates(features)
         features = torch.cat([coord_features, features], dim=1)
-        pred_logits, pred_kernel, pred_scores, iam = self.inst_branch(features)
-        mask_features = self.mask_branch(features)
+        pred_logits, pred_boxes, iam = self.inst_branch(features)
+        # mask_features = self.mask_branch(features)
 
-        N = pred_kernel.shape[1]
-        # mask_features: BxCxHxW
-        B, C, H, W = mask_features.shape
-        pred_masks = torch.bmm(pred_kernel, mask_features.view(
-            B, C, H * W)).view(B, N, H, W)
+        # N = pred_kernel.shape[1]
+        # # mask_features: BxCxHxW
+        # B, C, H, W = mask_features.shape
+        # pred_masks = torch.bmm(pred_kernel, mask_features.view(
+        #     B, C, H * W)).view(B, N, H, W)
 
-        pred_masks = F.interpolate(
-            pred_masks, scale_factor=self.scale_factor,
-            mode='bilinear', align_corners=False)
+        # pred_masks = F.interpolate(
+        #     pred_kernel, scale_factor=self.scale_factor,
+        #     mode='bilinear', align_corners=False)
 
         output = {
             "pred_logits": pred_logits,
-            "pred_masks": pred_masks,
-            "pred_scores": pred_scores,
+            "pred_boxes": pred_boxes,
         }
 
         if self.output_iam:
@@ -295,3 +293,17 @@ class GroupIAMSoftDecoder(BaseIAMDecoder):
 def build_sparse_inst_decoder(cfg):
     name = cfg.MODEL.SPARSE_INST.DECODER.NAME
     return SPARSE_INST_DECODER_REGISTRY.get(name)(cfg)
+
+class MLP(nn.Module):
+    """ Very simple multi-layer perceptron (also called FFN)"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x

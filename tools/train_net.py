@@ -53,7 +53,7 @@ class Trainer(DefaultTrainer):
                 )
             )
         if evaluator_type in ["coco", "coco_panoptic_seg"]:
-            evaluator_list.append(COCOMaskEvaluator(dataset_name, ("segm", ), True, output_folder))
+            evaluator_list.append(COCOMaskEvaluator(dataset_name, ("bbox", ), True, output_folder))
         if evaluator_type == "coco_panoptic_seg":
             evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_folder))
         if evaluator_type == "cityscapes_instance":
