@@ -46,7 +46,7 @@ def add_sparse_inst_config(cfg):
     cfg.MODEL.SPARSE_INST.LOSS.NAME = "SparseInstCriterion"
     cfg.MODEL.SPARSE_INST.LOSS.ITEMS = ("labels", "boxes")
     # loss weight
-    cfg.MODEL.SPARSE_INST.LOSS.CLASS_WEIGHT = 1.0
+    cfg.MODEL.SPARSE_INST.LOSS.CLASS_WEIGHT = 2.0
     cfg.MODEL.SPARSE_INST.LOSS.MASK_BBOX_WEIGHT = 5.0
     cfg.MODEL.SPARSE_INST.LOSS.MASK_GIOU_WEIGHT = 2.0
     # # iou-aware objectness loss weight
@@ -55,7 +55,7 @@ def add_sparse_inst_config(cfg):
     # [Matcher]
     cfg.MODEL.SPARSE_INST.MATCHER = CN()
     cfg.MODEL.SPARSE_INST.MATCHER.NAME = "SparseInstMatcher"
-    cfg.MODEL.SPARSE_INST.MATCHER.COST_CLASS = 1
+    cfg.MODEL.SPARSE_INST.MATCHER.COST_CLASS = 2
     cfg.MODEL.SPARSE_INST.MATCHER.COST_BBOX = 5
     cfg.MODEL.SPARSE_INST.MATCHER.COST_GIOU = 2
 

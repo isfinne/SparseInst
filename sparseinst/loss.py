@@ -217,58 +217,58 @@ class SparseInstCriterion(nn.Module):
         return losses
 
 
-@SPARSE_INST_MATCHER_REGISTRY.register()
-class SparseInstMatcherV1(nn.Module):
+# @SPARSE_INST_MATCHER_REGISTRY.register()
+# class SparseInstMatcherV1(nn.Module):
 
-    def __init__(self, cfg):
-        super().__init__()
-        self.alpha = cfg.MODEL.SPARSE_INST.MATCHER.ALPHA
-        self.beta = cfg.MODEL.SPARSE_INST.MATCHER.BETA
-        self.mask_score = dice_score
+#     def __init__(self, cfg):
+#         super().__init__()
+#         self.alpha = cfg.MODEL.SPARSE_INST.MATCHER.ALPHA
+#         self.beta = cfg.MODEL.SPARSE_INST.MATCHER.BETA
+#         self.mask_score = dice_score
 
-    @torch.no_grad()
-    def forward(self, outputs, targets, input_shape):
-        B, N, H, W = outputs["pred_masks"].shape
-        pred_masks = outputs['pred_masks']
-        pred_logits = outputs['pred_logits'].sigmoid()
+#     @torch.no_grad()
+#     def forward(self, outputs, targets, input_shape):
+#         B, N, H, W = outputs["pred_masks"].shape
+#         pred_masks = outputs['pred_masks']
+#         pred_logits = outputs['pred_logits'].sigmoid()
 
-        indices = []
+#         indices = []
 
-        for i in range(B):
-            tgt_ids = targets[i]["labels"]
-            # no annotations
-            if tgt_ids.shape[0] == 0:
-                indices.append((torch.as_tensor([]),
-                                torch.as_tensor([])))
-                continue
+#         for i in range(B):
+#             tgt_ids = targets[i]["labels"]
+#             # no annotations
+#             if tgt_ids.shape[0] == 0:
+#                 indices.append((torch.as_tensor([]),
+#                                 torch.as_tensor([])))
+#                 continue
 
-            tgt_masks = targets[i]['masks'].tensor.to(pred_masks)
-            pred_logit = pred_logits[i]
-            out_masks = pred_masks[i]
+#             tgt_masks = targets[i]['masks'].tensor.to(pred_masks)
+#             pred_logit = pred_logits[i]
+#             out_masks = pred_masks[i]
 
-            # upsampling:
-            # (1) padding/
-            # (2) upsampling to 1x input size (input_shape)
-            # (3) downsampling to 0.25x input size (output mask size)
-            ori_h, ori_w = tgt_masks.size(1), tgt_masks.size(2)
-            tgt_masks_ = torch.zeros(
-                (1, tgt_masks.size(0), input_shape[0], input_shape[1])).to(pred_masks)
-            tgt_masks_[0, :, :ori_h, :ori_w] = tgt_masks
-            tgt_masks = F.interpolate(
-                tgt_masks_, size=out_masks.shape[-2:], mode='bilinear', align_corners=False)[0]
+#             # upsampling:
+#             # (1) padding/
+#             # (2) upsampling to 1x input size (input_shape)
+#             # (3) downsampling to 0.25x input size (output mask size)
+#             ori_h, ori_w = tgt_masks.size(1), tgt_masks.size(2)
+#             tgt_masks_ = torch.zeros(
+#                 (1, tgt_masks.size(0), input_shape[0], input_shape[1])).to(pred_masks)
+#             tgt_masks_[0, :, :ori_h, :ori_w] = tgt_masks
+#             tgt_masks = F.interpolate(
+#                 tgt_masks_, size=out_masks.shape[-2:], mode='bilinear', align_corners=False)[0]
 
-            # compute dice score and classification score
-            tgt_masks = tgt_masks.flatten(1)
-            out_masks = out_masks.flatten(1)
+#             # compute dice score and classification score
+#             tgt_masks = tgt_masks.flatten(1)
+#             out_masks = out_masks.flatten(1)
 
-            mask_score = self.mask_score(out_masks, tgt_masks)
-            # Nx(Number of gts)
-            matching_prob = pred_logit[:, tgt_ids]
-            C = (mask_score ** self.alpha) * (matching_prob ** self.beta)
-            # hungarian matching
-            inds = linear_sum_assignment(C.cpu(), maximize=True)
-            indices.append(inds)
-        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
+#             mask_score = self.mask_score(out_masks, tgt_masks)
+#             # Nx(Number of gts)
+#             matching_prob = pred_logit[:, tgt_ids]
+#             C = (mask_score ** self.alpha) * (matching_prob ** self.beta)
+#             # hungarian matching
+#             inds = linear_sum_assignment(C.cpu(), maximize=True)
+#             indices.append(inds)
+#         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
 
 @SPARSE_INST_MATCHER_REGISTRY.register()

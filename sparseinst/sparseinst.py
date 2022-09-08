@@ -168,11 +168,7 @@ class SparseInst(nn.Module):
             labels_per_image = labels_per_image[keep]
             box_pred_per_image = box_pred_per_image[keep]
 
-            if scores_per_image.size(0) == 0:
-                result.scores = scores_per_image
-                result.pred_classes = labels_per_image
-                results.append(result)
-                continue
+            
 
             result = Instances(image_size)
             result.pred_boxes = Boxes(box_cxcywh_to_xyxy(box_pred_per_image))

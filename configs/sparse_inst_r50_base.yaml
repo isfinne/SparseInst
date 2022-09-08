@@ -4,4 +4,4 @@ MODEL:
   SPARSE_INST:
     DECODER:
       NAME: "BaseIAMDecoder"
-OUTPUT_DIR: "output/sparse_inst_r50_base_detect1"
+OUTPUT_DIR: "output/sparse_inst_r50_base_detect4"

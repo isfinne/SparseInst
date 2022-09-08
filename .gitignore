@@ -55,3 +55,4 @@ datasets
 pretrained_models
 minicoco
 coco-detection-visualization
+visualize
