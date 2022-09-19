@@ -175,8 +175,13 @@ def main(args):
     trainer.resume_or_load(resume=args.resume)
     return trainer.train()
 
+def force_cudnn_initialization():
+    s = 1
+    dev = torch.device('cuda')
+    torch.nn.functional.conv2d(torch.zeros(s, s, s, s, device=dev), torch.zeros(s, s, s, s, device=dev))
 
 if __name__ == "__main__":
+    force_cudnn_initialization()
     args = default_argument_parser().parse_args()
     print("Command Line Args:", args)
     launch(

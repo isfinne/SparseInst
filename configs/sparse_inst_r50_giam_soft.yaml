@@ -4,4 +4,7 @@ MODEL:
   SPARSE_INST:
     DECODER:
       NAME: "GroupIAMSoftDecoder"
+SOLVER:
+  AMP:
+    ENABLED: True
 OUTPUT_DIR: "output/sparse_inst_r50_giam_soft"

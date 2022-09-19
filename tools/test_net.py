@@ -10,7 +10,7 @@ from torch.cuda.amp import autocast
 from detectron2.config import get_cfg
 from detectron2.modeling import build_backbone
 from detectron2.checkpoint import DetectionCheckpointer
-from detectron2.structures import ImageList, Instances, BitMasks
+from detectron2.structures import ImageList, Instances, Boxes
 from detectron2.engine import default_argument_parser, default_setup
 from detectron2.data import build_detection_test_loader
 from detectron2.evaluation import COCOEvaluator, print_csv_format
@@ -18,6 +18,7 @@ from detectron2.evaluation import COCOEvaluator, print_csv_format
 sys.path.append(".")
 from sparseinst import build_sparse_inst_encoder, build_sparse_inst_decoder, add_sparse_inst_config
 from sparseinst import COCOMaskEvaluator
+from sparseinst.utils import box_cxcywh_to_xyxy
 
 
 device = torch.device('cuda:0')
@@ -98,29 +99,20 @@ class SparseInst(nn.Module):
         result = Instances(ori_shape)
         # scoring
         pred_logits = outputs["pred_logits"][0].sigmoid()
-        pred_scores = outputs["pred_scores"][0].sigmoid().squeeze()
-        pred_masks = outputs["pred_masks"][0].sigmoid()
+        pred_boxes = outputs["pred_boxes"][0].sigmoid()
         # obtain scores
-        scores, labels = pred_logits.max(dim=-1)
+        scores, labels = F.softmax(pred_logits, dim=-1)[:, :-1].max(-1)
         # remove by thresholding
         keep = scores > self.cls_threshold
-        scores = torch.sqrt(scores[keep] * pred_scores[keep])
+        scores = scores[keep]
         labels = labels[keep]
-        pred_masks = pred_masks[keep]
+        pred_boxes = pred_boxes[keep]
 
         if scores.size(0) == 0:
             return None
-        scores = rescoring_mask(scores, pred_masks > 0.45, pred_masks)
-        h, w = img_shape
-        # resize masks
-        pred_masks = F.interpolate(pred_masks.unsqueeze(1), size=pad_shape,
-                                   mode="bilinear", align_corners=False)[:, :, :h, :w]
-        pred_masks = F.interpolate(pred_masks, size=ori_shape, mode='bilinear',
-                                   align_corners=False).squeeze(1)
-        mask_pred = pred_masks > self.mask_threshold
-
-        mask_pred = BitMasks(mask_pred)
-        result.pred_masks = mask_pred
+        
+        result.pred_boxes = Boxes(box_cxcywh_to_xyxy(pred_boxes))
+        result.pred_boxes.scale(scale_x=ori_shape[1], scale_y=ori_shape[0])
         result.scores = scores
         result.pred_classes = labels
         return result
@@ -143,7 +135,7 @@ def test_sparseinst_speed(cfg, fp16=False):
     output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
 
     evaluator = COCOMaskEvaluator(
-        cfg.DATASETS.TEST[0], ("segm",), False, output_folder)
+        cfg.DATASETS.TEST[0], ("bbox",), False, output_folder)
     evaluator.reset()
     model.to(device)
     model.eval()
